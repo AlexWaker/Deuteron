@@ -50,6 +50,34 @@ cli分为5类：
 
 ***
 
+### 0. 网络管理 (Network)
+
+用于管理 CLI 可识别的网络定义。第一版网络管理只负责注册链的元信息，不自动配置 RPC、浏览器或代币列表；它的作用是让 `wallet import private-key --chain ...`、`wallet switch --chain ...`、`wallet ls --chain ...` 等命令能够识别“内置链 + 用户自定义链”。
+
+#### 0.1 添加网络 (Add)
+
+* **命令签名**：
+    `deu network add --id <network-id> --name <display-name> --ecosystem <ethereum|solana|bitcoin> [--aliases <a,b,c>]`[0]
+* **参数说明**：
+    * `--id` (必填): 网络唯一标识，供 CLI 内部持久化与命令行引用使用。建议使用小写字母、数字、`-`、`_` 组合，例如 `xlayer`、`linea`、`avalanche`。
+    * `--name` (必填): 面向人类展示的网络名称，例如 `BNB Smart Chain`。
+    * `--ecosystem` (必填): 该网络映射到的底层生态类型。目前支持 `ethereum`、`solana`、`bitcoin`。这决定了地址格式校验、HD 派生方式与私钥处理逻辑。
+    * `--aliases <a,b,c>` (可选): 额外可识别别名，使用逗号分隔，例如 `bnb,bnbchain`。
+* **业务逻辑**：
+    * 该命令会把自定义网络写入本地状态文件，供后续所有 `--chain` 场景复用。
+    * 自定义网络不能与任何内置网络或已有自定义网络的 `id / alias` 冲突。
+    * 由于当前实现是“生态映射层”，所以新增网络本质上是在声明“这个链按哪类底层生态处理”。例如把 `xlayer` 或 `linea` 映射到 `ethereum` 后，即可复用 EVM 私钥格式校验与 EVM 地址展示逻辑。
+
+#### 0.2 查看支持的网络 (List)
+
+* **命令签名**：
+    `deu network ls [--ecosystem <ethereum|solana|bitcoin>]`[0]
+* **参数说明**：
+    * `--ecosystem` (可选): 仅查看指定底层生态下的网络定义。
+* **业务逻辑**：
+    * 默认输出全部内置网络与本地已添加的自定义网络。
+    * 推荐输出字段包括 `Id | Name | Ecosystem | Source | Aliases`，其中 `Source` 用于区分 `builtin` 与 `custom`。
+
 ### 1. 钱包创建 (Create)
 
 创建全新的 HD 钱包（默认生成 12 位助记词）。
@@ -79,7 +107,7 @@ cli分为5类：
 * **命令签名**：
     `deu wallet import private-key --chain <chain_name> [--alias <name>] [--from-stdin | --from-file <path>]`[3]
 * **参数说明**：
-    * `--chain` (必填): 目标公链标识。**支持用户直觉输入**（忽略大小写，支持缩写如 `btc`, `sol`, `bsc`, `polygon`）。系统内部（Mapping 层）会自动将其映射为底层 SDK 支持的生态标识（如将 `bsc` 和 `polygon` 统一映射到 `ethereum` 模块处理）。
+    * `--chain` (必填): 目标公链标识。**支持用户直觉输入**（忽略大小写，支持缩写如 `btc`, `sol`, `bsc`, `polygon`）。系统内部（Mapping 层）会自动将其映射为底层 SDK 支持的生态标识（如将 `bsc` 和 `polygon` 统一映射到 `ethereum` 模块处理）。若目标链并非内置，可先通过 `deu network add ...` 注册为本地自定义网络。
     * `--from-stdin` / `--from-file <path>` (二选一，必填): 对应公链的私钥安全输入来源。系统会校验私钥格式是否与 `--chain` 匹配（如 SOL 为 Base58/ByteArray，EVM 为 Hex）。不匹配则报错。
     * `--alias` (可选): 同上，缺省则随机生成英文单词。
 
@@ -134,6 +162,56 @@ cli分为5类：
     * 读取本地配置中的 `current_context`。
     * 推荐输出 `Alias | Type | Chain | Address`，并支持 `--json`。
 
+### 6.1 链上资产查询 (Assets)
+
+查询某个钱包地址在目标链上的链上资产，属于只读能力，不触碰助记词或私钥，标记为[0]。该能力用于让AI Agent在执行借贷、转账、swap或签名前，先稳定读取当前钱包的可用资产。
+
+* **命令签名**：
+    `deu wallet assets [--current | --alias <name> --chain <chain_name>] [--rpc <url>]`[0]
+* **参数说明**：
+    * `--current` (可选): 查询当前 `wallet switch` 激活的钱包上下文。未提供 `--alias` 时默认读取当前上下文。
+    * `--alias` (可选): 查询指定钱包别名。
+    * `--chain` (条件必填): 当使用 `--alias` 查询 HD 钱包时必填；单私钥钱包可省略。
+    * `--rpc` (可选): 指定链上 RPC。Solana 默认读取 `SOLANA_RPC_URL`，若未设置则使用 `https://api.mainnet-beta.solana.com`。
+* **业务逻辑**：
+    * 第一版先支持 Solana 链资产查询，返回 SOL 原生余额与 SPL Token 非零余额（在 RPC 支持的前提下同时扫描标准 Token Program 与 Token-2022；若 RPC 不支持 Token-2022 查询则静默跳过）。
+    * 返回结构应包含 `alias`、`type`、`chain`、`address`、`rpcUrl`、`native`、`tokens`。
+    * `tokens` 中每个条目包含 `mint`、`tokenAccount`、`amount`、`decimals`、`rawAmount`，方便Agent直接做数值判断。
+    * 若当前上下文不是 Solana，命令应返回稳定错误码，提示切换到 Solana 或显式传入 `--alias <name> --chain solana`。
+
+### 6.2 资产转账 (Send)
+
+向目标地址发送资产。原生资产与 SPL/ERC-20 都属于需要访问敏感资料但不直接暴露敏感资料的能力，标记为[1]。该命令应默认要求用户确认；Agent 自动化场景必须显式传入 `--yes` 才能广播，避免误转账。
+
+* **命令签名**：
+    `deu wallet send [--current | --alias <name> --chain <chain_name>] --to <address> --amount <amount> [--asset native|spl|erc20] [--mint <mint>] [--token <contract>] [--rpc <url>] [--fee-rate <sat/vB>] [--dry-run] [--yes]`[1]
+* **参数说明**：
+    * `--current` (可选): 使用当前 `wallet switch` 激活的钱包上下文。未提供 `--alias` 时默认读取当前上下文。
+    * `--alias` (可选): 指定发送方钱包别名。
+    * `--chain` (条件必填): 当使用 `--alias` 指向 HD 钱包时必填；单私钥钱包可省略。
+    * `--to` (必填): 收款地址。系统会按目标链校验地址格式。
+    * `--amount` (必填): 发送数量，使用人类可读单位，例如 `0.01` SOL、`0.001` ETH、`0.0001` BTC。
+    * `--asset` (可选): `native`（默认）| `spl` | `erc20`。
+    * `--mint` (条件必填): 当 `--asset spl` 时必填，为 SPL mint 地址。
+    * `--token` (条件必填): 当 `--asset erc20` 时必填，为 ERC-20 合约地址。
+    * `--rpc` (可选): 指定 RPC 或链上 API。Solana 默认读取 `SOLANA_RPC_URL`；EVM 链可读取 `<CHAIN>_RPC_URL`；Bitcoin 默认使用 `https://mempool.space/api`，也可通过 `BITCOIN_API_URL` 或 `--rpc` 覆盖。
+    * `--fee-rate <sat/vB>` (可选): Bitcoin 转账手续费率。未传入时自动读取 mempool 推荐费率。
+    * `--dry-run` (可选): 构建或估算交易但不广播，用于Agent执行前检查。
+    * `--yes` (可选): 跳过交互式确认并广播，供自动化流程显式使用。
+* **业务逻辑**：
+    * **原生**：覆盖 Solana、EVM 生态链、Bitcoin。Solana 使用 `SystemProgram.transfer`；EVM 发送 `value`；Bitcoin 使用 P2WPKH UTXO、PSBT 与 mempool API 广播。
+    * **SPL**：根据 mint 账户 owner 自动识别标准 Token Program 或 Token-2022。若收款方无 ATA，则由发送方付租金创建关联代币账户（需发送方持有足够 SOL）。
+    * **ERC-20**：读取合约 `decimals`，调用 `transfer`；`--dry-run` 时估算 gas，不广播。
+    * 返回结构在原生基础上可包含 `mint`、`tokenContract`、`decimals`、`tokenProgram`（SPL）。
+    * 风险提示：_tax / rebasing / 黑名单等异常 ERC-20 可能导致转账失败或损失；无限授权应单独通过 `approve` 命令完成并显性确认。
+
+### 6.3 ERC-20 授权 (Approve)
+
+为 DEX、路由或聚合器预授权 ERC-20 花费额度，属于高敏感操作（可能被恶意 spender 滥用），标记为[1]。必须显式传入 `--spender`，且默认要求确认。
+
+* **命令签名**：
+    `deu wallet approve erc20 [--current | --alias <name> --chain <chain>] --token <contract> --spender <address> [--amount <amount> | --unlimited] [--rpc <url>] [--dry-run] [--yes]`[1]
+
 ### 7. 钱包重命名 (Rename)
 
 修改已有钱包的别名。
@@ -157,6 +235,20 @@ cli分为5类：
     * 默认要求用户二次确认。
     * 如果目标为单私钥钱包，则删除钱包元数据，并从Keychain中移除对应私钥项。
     * 如果目标为助记词派生钱包，则仅删除该 alias 与其地址元数据；只有当该助记词根已无任何 alias 引用时，才允许删除其对应的Keychain密钥项。
+
+### 8.1 钱包卸载 (Uninstall)
+
+一次性清空本地全部钱包数据，属于最高风险的销毁类操作。
+
+* **命令签名**：
+    `deu wallet uninstall [--yes]`[4]
+* **参数说明**：
+    * `--yes` (可选): 跳过交互式确认，供自动化流程显式使用。
+* **业务逻辑**：
+    * 默认要求用户二次确认，并走风险等级 4 的敏感授权流程。
+    * 删除本地全部钱包记录，包括 HD 钱包、单私钥钱包、助记词分组元数据。
+    * 删除所有关联的 Keychain 密钥项，并清空当前激活的钱包上下文。
+    * 该命令只卸载本地钱包数据，不影响 CLI 程序本身是否已安装，但会重置 `isInitialized` 引导状态，使后续 `deu init` 可以重新执行首次引导流程。
 
 ### 9. 钱包导出 (Export)
 
@@ -387,3 +479,10 @@ Borrow 当前不应设计成 API 模式，而应明确写死为 SDK 模式。
 > 3. **状态标记**：完成上述引导后，在本地配置文件中标记 `isInitialized: true`，确保用户以后日常调用转账等命令时，不再重复显示这串冗长的欢迎语。
 
 ***
+solana是最适合agent交易的链，庞大市场，币 股 卡牌，用一套sdk交易所有
+
+第一个项目agent私钥管理问题
+
+后续：集成支付、专属rpc
+
+agent使用情况？积分系统

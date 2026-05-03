@@ -1,5 +1,6 @@
 node_modules
 dist
+.next
 .native
 rust/agent/target
 npm-debug.log*

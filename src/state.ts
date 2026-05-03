@@ -7,6 +7,7 @@ import type { MnemonicGroupRecord, WalletRecord, WalletState } from "./types.js"
 const DEFAULT_STATE: WalletState = {
   version: 1,
   isInitialized: false,
+  customChains: {},
   mnemonicGroups: {},
   wallets: {},
 };
@@ -27,6 +28,7 @@ export async function loadState(): Promise<WalletState> {
     return {
       version: 1,
       isInitialized: parsed.isInitialized ?? false,
+      customChains: parsed.customChains ?? {},
       mnemonicGroups: parsed.mnemonicGroups ?? {},
       wallets: parsed.wallets ?? {},
       currentContext: parsed.currentContext,

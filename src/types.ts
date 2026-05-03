@@ -39,12 +39,22 @@ export interface PrivateKeyWalletRecord {
   updatedAt: string;
 }
 
+export interface CustomChainRecord {
+  id: SupportedChain;
+  displayName: string;
+  ecosystem: Ecosystem;
+  aliases: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
 export type WalletRecord = HdWalletRecord | PrivateKeyWalletRecord;
 
 export interface WalletState {
   version: 1;
   isInitialized?: boolean;
   currentContext?: CurrentContext;
+  customChains: Record<string, CustomChainRecord>;
   mnemonicGroups: Record<string, MnemonicGroupRecord>;
   wallets: Record<string, WalletRecord>;
 }

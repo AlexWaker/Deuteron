@@ -13,7 +13,8 @@ import {
 } from "./config.js";
 
 const START_TIMEOUT_MS = 3_000;
-const REQUEST_TIMEOUT_MS = 1_500;
+const REQUEST_TIMEOUT_MS = 30_000;
+let agentStartPromise: Promise<AgentStatus> | undefined;
 
 export type AgentEnvelope<T = Record<string, unknown>> = {
   ok: boolean;
@@ -173,18 +174,37 @@ export async function stopAgent(): Promise<AgentStatus> {
 }
 
 export async function storeSecret(key: string, value: string): Promise<void> {
+  await ensureAgentRunning();
   const response = await sendRequest<{ key: string }>("store_secret", { key, value });
   assertAgentSuccess(response);
 }
 
 export async function readSecret(key: string): Promise<string> {
+  await ensureAgentRunning();
   const response = await sendRequest<{ key: string; value: string }>("read_secret", { key });
   return assertAgentSuccess(response).value;
 }
 
 export async function deleteSecret(key: string): Promise<boolean> {
+  await ensureAgentRunning();
   const response = await sendRequest<{ key: string; found: boolean }>("delete_secret", { key });
   return assertAgentSuccess(response).found;
+}
+
+async function ensureAgentRunning(): Promise<void> {
+  const status = await getAgentStatus();
+  if (status.running) {
+    return;
+  }
+
+  agentStartPromise ??= startAgent().finally(() => {
+    agentStartPromise = undefined;
+  });
+
+  const started = await agentStartPromise;
+  if (!started.running) {
+    throw new Error(started.error?.message ?? `Agent failed to start: ${started.code}`);
+  }
 }
 
 async function waitForAgent(timeoutMs: number): Promise<void> {

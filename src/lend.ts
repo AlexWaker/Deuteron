@@ -31,6 +31,8 @@ import { getCurrentWalletContext } from "./wallet.js";
 const JUPITER_LEND_API_BASE_URL = "https://api.jup.ag/lend/v1";
 const TOKEN_PROGRAM_PUBLIC_KEY = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const RPC_RETRY_DELAYS_MS = [400, 1000, 2200] as const;
+const LEND_RPC_TIMEOUT_MS = getPositiveIntegerEnv("DEU_LEND_RPC_TIMEOUT_MS") ?? 8000;
+const JUPITER_API_TIMEOUT_MS = getPositiveIntegerEnv("DEU_JUP_API_TIMEOUT_MS") ?? 8000;
 
 type EarnReadSource = "api" | "sdk" | "auto";
 type EarnBuildSource = "api" | "sdk";
@@ -265,28 +267,34 @@ async function handleBorrowCommand(
 
 async function handleEarnTokens(parsed: ParsedArgs): Promise<CommandResult> {
   const requestedSource = resolveEarnReadSource(parsed);
-  const apiKey = getApiKey(parsed);
-  const source: Exclude<EarnReadSource, "auto"> =
-    requestedSource === "auto" ? (apiKey ? "api" : "sdk") : requestedSource;
+  if (requestedSource !== "sdk") {
+    try {
+      const items = (await fetchJupiterApi("earn/tokens", {
+        apiKey: getApiKey(parsed),
+      })) as unknown[];
+      const normalized = items.map(normalizeApiEarnToken);
 
-  if (source === "api") {
-    const items = (await fetchJupiterApi("earn/tokens", {
-      apiKey: requireApiKey(parsed),
-    })) as unknown[];
-    const normalized = items.map(normalizeApiEarnToken);
-
-    return {
-      code: "lend.earn.tokens",
-      data: {
-        source,
-        items: normalized,
-      },
-      human: renderEarnTokens(normalized, `Jupiter Earn tokens (${source})`),
-    };
+      return {
+        code: "lend.earn.tokens",
+        data: {
+          source: "api",
+          items: normalized,
+        },
+        human: renderEarnTokens(normalized, "Jupiter Earn tokens (api)"),
+      };
+    } catch (error) {
+      if (requestedSource === "api") {
+        throw error;
+      }
+    }
   }
 
   const { client, rpcUrl } = createReadClient(parsed);
-  const items = await client.lending.getAllJlTokenDetails();
+  const source = "sdk";
+  const items = await withLendRpcHandling(
+    "load Jupiter Earn tokens from Solana RPC",
+    () => client.lending.getAllJlTokenDetails(),
+  );
   const normalized = items.map(normalizeSdkEarnToken);
 
   return {
@@ -302,9 +310,6 @@ async function handleEarnTokens(parsed: ParsedArgs): Promise<CommandResult> {
 
 async function handleEarnPositions(parsed: ParsedArgs): Promise<CommandResult> {
   const requestedSource = resolveEarnReadSource(parsed);
-  const apiKey = getApiKey(parsed);
-  const source: Exclude<EarnReadSource, "auto"> =
-    requestedSource === "auto" ? (apiKey ? "api" : "sdk") : requestedSource;
   const owner = await resolveOwner(parsed, {
     commandLabel: "lend earn positions",
     usage:
@@ -312,27 +317,37 @@ async function handleEarnPositions(parsed: ParsedArgs): Promise<CommandResult> {
     allowImplicitCurrent: true,
   });
 
-  if (source === "api") {
-    const items = (await fetchJupiterApi("earn/positions", {
-      apiKey: requireApiKey(parsed),
-      query: { users: owner.address },
-    })) as unknown[];
-    const normalized = items.map(normalizeApiEarnPosition);
+  if (requestedSource !== "sdk") {
+    try {
+      const items = (await fetchJupiterApi("earn/positions", {
+        apiKey: getApiKey(parsed),
+        query: { users: owner.address },
+      })) as unknown[];
+      const normalized = items.map(normalizeApiEarnPosition);
 
-    return {
-      code: "lend.earn.positions",
-      data: {
-        source,
-        owner: owner.address,
-        ownerSource: owner.source,
-        items: normalized,
-      },
-      human: renderEarnPositions(normalized, `Jupiter Earn positions for ${owner.address} (${source})`),
-    };
+      return {
+        code: "lend.earn.positions",
+        data: {
+          source: "api",
+          owner: owner.address,
+          ownerSource: owner.source,
+          items: normalized,
+        },
+        human: renderEarnPositions(normalized, `Jupiter Earn positions for ${owner.address} (api)`),
+      };
+    } catch (error) {
+      if (requestedSource === "api") {
+        throw error;
+      }
+    }
   }
 
   const { client, rpcUrl } = createReadClient(parsed);
-  const items = await client.lending.getUserPositions(owner.publicKey);
+  const source = "sdk";
+  const items = await withLendRpcHandling(
+    `load Jupiter Earn positions for ${owner.address}`,
+    () => client.lending.getUserPositions(owner.publicKey),
+  );
   const normalized = items.map((item) => normalizeSdkEarnPosition(item, owner.address));
 
   return {
@@ -408,10 +423,13 @@ async function handleEarnPreview(parsed: ParsedArgs): Promise<CommandResult> {
   }
 
   const { client, rpcUrl } = createReadClient(parsed);
-  const previews = await client.lending.getPreviews(
-    asset,
-    assetsRaw ?? new BN(0),
-    sharesRaw ?? new BN(0),
+  const previews = await withLendRpcHandling(
+    `load Jupiter Earn preview for ${asset.toBase58()}`,
+    () => client.lending.getPreviews(
+      asset,
+      assetsRaw ?? new BN(0),
+      sharesRaw ?? new BN(0),
+    ),
   );
   const normalized = {
     asset: asset.toBase58(),
@@ -473,7 +491,10 @@ async function handleEarnBuild(parsed: ParsedArgs, operation: "deposit" | "withd
   }
 
   const { client, connection, rpcUrl } = createReadClient(parsed);
-  const token = await findEarnToken(client, asset);
+  const token = await withLendRpcHandling(
+    `load Jupiter Earn token metadata for ${asset.toBase58()}`,
+    () => findEarnToken(client, asset),
+  );
   const input = getEarnAmountInput(parsed, operation, usage);
   const rawAmount = parseDisplayAmountToRaw(input.value, token.decimals, input.flagName);
 
@@ -486,11 +507,17 @@ async function handleEarnBuild(parsed: ParsedArgs, operation: "deposit" | "withd
     signer: owner.publicKey,
     connection,
   };
-  const instructions = await buildEarnSdkInstructions(operation, builderParams, rawAmount);
+  const instructions = await withLendRpcHandling(
+    `build Jupiter Earn ${operation} instructions`,
+    () => buildEarnSdkInstructions(operation, builderParams, rawAmount),
+  );
   const serializedInstructions = instructions.map(serializeInstruction);
   const transactionBase64 =
     format === "transaction"
-      ? await buildUnsignedTransactionBase64(connection, owner.publicKey, instructions)
+      ? await withLendRpcHandling(
+        `build Jupiter Earn ${operation} transaction`,
+        () => buildUnsignedTransactionBase64(connection, owner.publicKey, instructions),
+      )
       : undefined;
 
   const data = {
@@ -622,14 +649,20 @@ async function handleBorrowBuild(
 
   if (operation === "create-position") {
     const vaultId = parseIntegerFlag(parsed, "vault-id", usage, { minimum: 1 });
-    const result = await getInitPositionIx({
-      vaultId,
-      connection,
-      signer: owner.publicKey,
-    });
+    const result = await withLendRpcHandling(
+      `build Jupiter Borrow ${operation} instructions`,
+      () => getInitPositionIx({
+        vaultId,
+        connection,
+        signer: owner.publicKey,
+      }),
+    );
     const instructions = [result.ix];
     const serializedInstructions = instructions.map(serializeInstruction);
-    const transaction = await buildUnsignedTransactionBase64(connection, owner.publicKey, instructions);
+    const transaction = await withLendRpcHandling(
+      `build Jupiter Borrow ${operation} transaction`,
+      () => buildUnsignedTransactionBase64(connection, owner.publicKey, instructions),
+    );
 
     return {
       code: "lend.borrow.create_position.build",
@@ -658,19 +691,25 @@ async function handleBorrowBuild(
       throw new CliError("cli.flag_invalid", "Flag --debt-amount-raw must be greater than 0");
     }
     const to = parseOptionalPublicKeyFlag(parsed, "to");
-    const result = await getLiquidateIx({
-      vaultId,
-      debtAmount,
-      to: to ?? owner.publicKey,
-      signer: owner.publicKey,
-      connection,
-    });
+    const result = await withLendRpcHandling(
+      `build Jupiter Borrow ${operation} instructions`,
+      () => getLiquidateIx({
+        vaultId,
+        debtAmount,
+        to: to ?? owner.publicKey,
+        signer: owner.publicKey,
+        connection,
+      }),
+    );
     const serializedInstructions = result.ixs.map(serializeInstruction);
-    const transaction = await buildUnsignedTransactionBase64(
-      connection,
-      owner.publicKey,
-      result.ixs,
-      result.addressLookupTableAccounts,
+    const transaction = await withLendRpcHandling(
+      `build Jupiter Borrow ${operation} transaction`,
+      () => buildUnsignedTransactionBase64(
+        connection,
+        owner.publicKey,
+        result.ixs,
+        result.addressLookupTableAccounts,
+      ),
     );
 
     return {
@@ -711,20 +750,26 @@ async function handleBorrowBuild(
   }
 
   const { colAmount, debtAmount } = mapBorrowOperationToAmounts(operation, amountRaw);
-  const result = await getOperateIx({
-    vaultId,
-    positionId,
-    colAmount,
-    debtAmount,
-    connection,
-    signer: owner.publicKey,
-  });
+  const result = await withLendRpcHandling(
+    `build Jupiter Borrow ${operation} instructions`,
+    () => getOperateIx({
+      vaultId,
+      positionId,
+      colAmount,
+      debtAmount,
+      connection,
+      signer: owner.publicKey,
+    }),
+  );
   const serializedInstructions = result.ixs.map(serializeInstruction);
-  const transaction = await buildUnsignedTransactionBase64(
-    connection,
-    owner.publicKey,
-    result.ixs,
-    result.addressLookupTableAccounts,
+  const transaction = await withLendRpcHandling(
+    `build Jupiter Borrow ${operation} transaction`,
+    () => buildUnsignedTransactionBase64(
+      connection,
+      owner.publicKey,
+      result.ixs,
+      result.addressLookupTableAccounts,
+    ),
   );
 
   return {
@@ -762,9 +807,49 @@ function createReadClient(parsed: ParsedArgs): {
   client: Client;
 } {
   const rpcUrl = getStringFlag(parsed, "rpc") ?? process.env.SOLANA_RPC_URL ?? DEFAULT_RPC_URL;
-  const connection = new Connection(rpcUrl, "confirmed");
+  // const connection = new Connection(rpcUrl, "confirmed");
+  const connection = new Connection(rpcUrl, {
+    commitment: "confirmed",
+    fetchMiddleware: (info, init, next) => {
+      next(info, {
+        ...init,
+        signal: mergeAbortSignals(init?.signal, AbortSignal.timeout(LEND_RPC_TIMEOUT_MS)),
+      });
+    },
+  });
   const client = new Client(connection);
   return { rpcUrl, connection, client };
+}
+
+async function withLendRpcHandling<T>(label: string, operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    if (error instanceof CliError) {
+      throw error;
+    }
+
+    if (isTimeoutLikeError(error)) {
+      throw new CliError(
+        "lend.rpc_timeout",
+        `Timed out while trying to ${label}. Check --rpc or SOLANA_RPC_URL, then try again.`,
+        {
+          timeoutMs: LEND_RPC_TIMEOUT_MS,
+          cause: error instanceof Error ? error.message : String(error),
+        },
+      );
+    }
+
+    if (isRetryableRpcError(error)) {
+      throw new CliError(
+        "lend.rpc_request_failed",
+        `Failed to ${label}`,
+        error instanceof Error ? { cause: error.message } : undefined,
+      );
+    }
+
+    throw error;
+  }
 }
 
 async function withBorrowReadNormalization<T>(
@@ -846,7 +931,7 @@ function requireApiKey(parsed: ParsedArgs): string {
 async function fetchJupiterApi(
   path: string,
   options: {
-    apiKey: string;
+    apiKey?: string;
     method?: "GET" | "POST";
     query?: Record<string, string>;
     body?: Record<string, string>;
@@ -859,14 +944,40 @@ async function fetchJupiterApi(
     }
   }
 
-  const response = await fetch(url, {
-    method: options.method ?? "GET",
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": options.apiKey,
-    },
-    body: options.body ? JSON.stringify(options.body) : undefined,
-  });
+  const timeoutSignal = AbortSignal.timeout(JUPITER_API_TIMEOUT_MS);
+  let response: Response;
+
+  try {
+    response = await fetch(url, {
+      method: options.method ?? "GET",
+      headers: {
+        "content-type": "application/json",
+        ...(options.apiKey ? { "x-api-key": options.apiKey } : {}),
+      },
+      body: options.body ? JSON.stringify(options.body) : undefined,
+      signal: timeoutSignal,
+    });
+  } catch (error) {
+    if (isTimeoutLikeError(error)) {
+      throw new CliError(
+        "lend.api_request_timeout",
+        `Jupiter Lend API request timed out after ${JUPITER_API_TIMEOUT_MS}ms`,
+        {
+          path,
+          timeoutMs: JUPITER_API_TIMEOUT_MS,
+        },
+      );
+    }
+
+    throw new CliError(
+      "lend.api_request_failed",
+      "Failed to reach Jupiter Lend API",
+      {
+        path,
+        cause: error instanceof Error ? error.message : String(error),
+      },
+    );
+  }
 
   if (!response.ok) {
     const text = await response.text();
@@ -1673,6 +1784,26 @@ async function delay(ms: number): Promise<void> {
   });
 }
 
+function mergeAbortSignals(primary: AbortSignal | null | undefined, secondary: AbortSignal): AbortSignal {
+  if (!primary) {
+    return secondary;
+  }
+
+  return typeof AbortSignal.any === "function"
+    ? AbortSignal.any([primary, secondary])
+    : primary;
+}
+
+function getPositiveIntegerEnv(name: string): number | undefined {
+  const raw = process.env[name];
+  if (!raw) {
+    return undefined;
+  }
+
+  const value = Number.parseInt(raw, 10);
+  return Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
 function extractParsedTokenAccountInfo(data: unknown): { mint: string; amount: string; owner?: string } | undefined {
   if (!data || typeof data !== "object" || !("parsed" in data)) {
     return undefined;
@@ -1732,9 +1863,17 @@ function isRetryableRpcError(error: unknown): boolean {
     return false;
   }
 
-  return /429|Too Many Requests|fetch failed|ETIMEDOUT|ECONNRESET|ENOTFOUND|socket hang up/i.test(
+  return /429|Too Many Requests|fetch failed|ETIMEDOUT|ECONNRESET|ENOTFOUND|socket hang up|aborted|timeout/i.test(
     error.message,
   );
+}
+
+function isTimeoutLikeError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  return /aborted|timeout/i.test(error.message) || error.name === "AbortError";
 }
 
 function renderEarnTokens(items: EarnTokenSummary[], title: string): string {

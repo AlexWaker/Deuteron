@@ -10,8 +10,7 @@ import { derivePath } from "ed25519-hd-key";
 import { SigningKey, Wallet } from "ethers";
 // import * as wif from "wif";
 
-// import { deleteSecret, readSecret, startAgent, storeSecret } from "./agent.js";
-import { deleteSecret, readSecret, storeSecret } from "./secrets.js";
+import { deleteSecret, readSecret, storeSecret } from "./agent.js";
 import {
   DEFAULT_HD_CHAINS,
   getChainSpec,
@@ -86,6 +85,19 @@ export interface WalletRemovalView {
   removed: true;
   kind: "HD" | "PK";
   deletedSecret: boolean;
+}
+
+export interface WalletUninstallView {
+  removedAll: true;
+  removedWallets: number;
+  removedHdWallets: number;
+  removedPrivateKeyWallets: number;
+  removedMnemonicGroups: number;
+  deletedSecrets: number;
+  missingSecrets: number;
+  clearedContext: boolean;
+  resetInitialized: boolean;
+  aliases: string[];
 }
 
 export interface WalletRenameView {
@@ -292,6 +304,17 @@ export async function getCurrentWalletContext(): Promise<WalletContextView> {
   return resolveContextView(state, state.currentContext);
 }
 
+export async function getWalletContext(alias: string, chainValue?: string): Promise<WalletContextView> {
+  const state = await loadState();
+  const wallet = getWalletOrThrow(state, normalizeAlias(alias));
+  const chain = resolveSwitchChain(wallet, chainValue);
+
+  return resolveContextView(state, {
+    alias: wallet.alias,
+    chain,
+  });
+}
+
 export async function renameWallet(alias: string, newAlias: string): Promise<WalletRenameView> {
   const state = await loadState();
   const currentAlias = normalizeAlias(alias);
@@ -364,6 +387,57 @@ export async function removeWallet(alias: string): Promise<WalletRemovalView> {
     kind: "HD",
     deletedSecret,
   };
+}
+
+export async function uninstallWallets(): Promise<WalletUninstallView> {
+  const state = await loadState();
+  const wallets = Object.values(state.wallets);
+  const mnemonicGroups = Object.values(state.mnemonicGroups);
+  const secretIds = new Set<string>();
+
+  for (const wallet of wallets) {
+    if (wallet.kind === "private-key") {
+      secretIds.add(wallet.secretId);
+    }
+  }
+
+  for (const group of mnemonicGroups) {
+    secretIds.add(group.secretId);
+  }
+
+  let deletedSecrets = 0;
+  let missingSecrets = 0;
+
+  for (const secretId of secretIds) {
+    const deleted = await deleteSecret(secretId);
+    if (deleted) {
+      deletedSecrets += 1;
+      continue;
+    }
+
+    missingSecrets += 1;
+  }
+
+  const result: WalletUninstallView = {
+    removedAll: true,
+    removedWallets: wallets.length,
+    removedHdWallets: wallets.filter((wallet) => wallet.kind === "hd").length,
+    removedPrivateKeyWallets: wallets.filter((wallet) => wallet.kind === "private-key").length,
+    removedMnemonicGroups: mnemonicGroups.length,
+    deletedSecrets,
+    missingSecrets,
+    clearedContext: Boolean(state.currentContext),
+    resetInitialized: Boolean(state.isInitialized),
+    aliases: wallets.map((wallet) => wallet.alias).sort((left, right) => left.localeCompare(right)),
+  };
+
+  state.wallets = {};
+  state.mnemonicGroups = {};
+  delete state.currentContext;
+  state.isInitialized = false;
+  await saveState(state);
+
+  return result;
 }
 
 export async function exportMnemonic(alias: string): Promise<WalletExportView> {
